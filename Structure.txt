@@ -1,0 +1,17 @@
+anomaly_detection/
+├── data/
+│   └── influx.py
+├── preprocessing/
+│   └── normalize.py
+├── model/
+│   └── isolation_forest.py
+├── visualization/
+│   └── plots.py
+├── api/
+│   └── main.py
+├── outputs/
+│   ├── results/
+│   │   └── worst_performing_services.csv
+│   └── visualizations/
+│       ├── scatter/
+│       └── bar/
