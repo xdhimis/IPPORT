@@ -1,63 +1,61 @@
 import pandas as pd
 import numpy as np
+from scipy.stats import skew, kurtosis
 
-def normalize_per_service(group, service_stats=None, min_std=1e-6):
-    group_id = f"{group['ServerName'].iloc[0]}_{group['IP_port'].iloc[0]}"
-    if service_stats is None:
-        conn_std = max(group['connection_count'].std(), min_std)
-        service_stats = {
-            'conn_mean': group['connection_count'].mean(),
-            'conn_std': conn_std
-        }
-        group['conn_zscore'] = (group['connection_count'] - service_stats['conn_mean']) / service_stats['conn_std']
-    else:
-        conn_std = max(service_stats['conn_std'], min_std)
-        group['conn_zscore'] = (group['connection_count'] - service_stats['conn_mean']) / conn_std
-    group['conn_zscore'] = group['conn_zscore'].fillna(0)
-    group['conn_log'] = np.log1p(group['connection_count'])
-    return group, service_stats
+MIN_STD = 1e-6
 
-def preprocess_data(data, train_data_stats=None, is_training=False):
-    if data.empty:
-        return pd.DataFrame(), train_data_stats or {}
-    
-    data_groups = []
+def normalize_data(df, means=None, stds=None, is_training=True):
+    group_key = ['IP_port', 'ServerName']
     if is_training:
-        train_data_stats = {}
-        for (server, ip_port), group in data.groupby(['ServerName', 'IP_port']):
-            normalized_group, stats = normalize_per_service(group)
-            data_groups.append(normalized_group)
-            train_data_stats[f"{server}_{ip_port}"] = stats
-    else:
-        default_stats = {
-            'conn_mean': data['connection_count'].mean(),
-            'conn_std': max(data['connection_count'].std(), 1e-6)
-        }
-        for (server, ip_port), group in data.groupby(['ServerName', 'IP_port']):
-            stats = train_data_stats.get(f"{server}_{ip_port}", default_stats)
-            normalized_group, _ = normalize_per_service(group, stats)
-            data_groups.append(normalized_group)
-    
-    data = pd.concat(data_groups).reset_index(drop=True)
-    
-    # Extract temporal features
-    data['hour'] = data['timestamp'].dt.hour
-    data['day_of_week'] = data['timestamp'].dt.dayofweek
-    
-    # Aggregate per service
-    agg_data = data.groupby(['ServerName', 'IP_port']).agg({
-        'conn_zscore': ['mean', 'max'],
-        'conn_log': ['mean', 'median', 'max'],
-        'hour': 'mean',
-        'day_of_week': 'mean',
-        'connection_count': ['mean', 'count']
-    }).reset_index()
-    
-    # Flatten column names
-    agg_data.columns = ['_'.join(col).strip() if col[1] else col[0] for col in agg_data.columns]
-    
-    # Filter low data volume (relaxed for real-time)
-    min_count = 10 if is_training else 1
-    agg_data = agg_data[agg_data['connection_count_count'] >= min_count]
-    
-    return agg_data, train_data_stats
+        groups = df.groupby(group_key)
+        means = groups['connection_count'].mean()
+        stds = groups['connection_count'].std().clip(lower=MIN_STD)
+    def z_func(x):
+        key = tuple(x.name) if isinstance(x.name, tuple) else x.name
+        return (x - means[key]) / stds[key]
+    df['conn_zscore'] = df.groupby(group_key)['connection_count'].transform(z_func)
+    df['conn_zscore'] = df['conn_zscore'].fillna(0)  # Impute NaNs
+    df['conn_log'] = np.log1p(df['connection_count'])  # Existing log transform
+    return df, means, stds
+
+def add_features(df, window=10):  # window ≈5 min for 30s intervals
+    group_key = ['IP_port', 'ServerName']
+    df = df.sort_values(group_key + ['timestamp'])
+    # Temporal features (from discussion)
+    df['rolling_mean'] = df.groupby(group_key)['connection_count'].rolling(5).mean().reset_index(0, drop=True)
+    df['diff'] = df.groupby(group_key)['connection_count'].diff()
+    df['rate_change'] = df['diff'] / df['connection_count'].shift(1)
+    # Paper-inspired (MicroHECL adaptations)
+    rolling_max = df.groupby(group_key)['connection_count'].rolling(window).max().reset_index(0, drop=True)
+    rolling_mean = df.groupby(group_key)['connection_count'].rolling(window).mean().reset_index(0, drop=True)
+    df['over_max_count'] = (df['connection_count'] > rolling_max.shift(1)).groupby(df.groupby(group_key).cumcount() // window).transform('sum')
+    df['over_avg_count'] = (df['connection_count'] > rolling_mean.shift(1)).groupby(df.groupby(group_key).cumcount() // window).transform('sum')
+    df['delta_max'] = df.groupby(group_key)['connection_count'].transform(lambda x: x.rolling(window).max().diff(window))
+    df['delta_avg'] = df.groupby(group_key)['connection_count'].transform(lambda x: x.rolling(window).mean().diff(window))
+    df['ratio_avg'] = df['connection_count'] / rolling_mean.shift(1)
+    # Existing temporal
+    df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
+    df['day_of_week'] = pd.to_datetime(df['timestamp']).dt.dayofweek
+    df = df.fillna(0)
+    return df
+
+def z_normalize_features(df, features, means_dict=None, stds_dict=None, is_training=True):
+    group_key = ['IP_port', 'ServerName']
+    if is_training:
+        means_dict = {}
+        stds_dict = {}
+        for feat in features:
+            groups = df.groupby(group_key)
+            means_dict[feat] = groups[feat].mean()
+            stds_dict[feat] = groups[feat].std().clip(lower=MIN_STD)
+    for feat in features:
+        def z_func(x, feat):
+            key = tuple(x.name) if isinstance(x.name, tuple) else x.name
+            return (x - means_dict[feat][key]) / stds_dict[feat][key]
+        df[f'z_{feat}'] = df.groupby(group_key)[feat].transform(lambda x: z_func(x, feat))
+    return df, means_dict, stds_dict
+
+def compute_stats(df):
+    group_key = ['IP_port', 'ServerName']
+    stats = df.groupby(group_key)['connection_count'].agg(['mean', 'std', skew, kurtosis])
+    return stats
