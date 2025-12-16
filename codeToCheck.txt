@@ -1,0 +1,127 @@
+That is a highly insightful constraint. In a real-world, black-box scenario, you often do not have the explicit caller-callee relationship (the "trace" data) and must infer the dependencies (the edges) solely from time-series performance metrics (QPS, RT, Error Rate) collected from each service (the nodes).
+
+This step is called Dependency Graph Inference or Causal Discovery, and it is where AI/ML methods truly shine.
+
+The core principle used is Causality and Correlation: If Service A calls Service B, then a sudden change in Service B's metrics (especially RT or Error Rate) will often be followed, moments later, by a corresponding change in Service A's metrics.
+
+Here is the step-by-step approach using a simple, computationally cheap method based on Time-Lagged Cross-Correlation, which is a practical way to infer causation from time-series data.
+
+
+Step 2: AI/ML Inference using Cross-Correlation
+We will use Time-Lagged Cross-Correlation on the Response Time (RT) series.
+
+Hypothesis: If Service Y calls Service X (i.e., Y→X), then a spike in X's RT will cause a spike in Y's RT at the same time or a little later.
+
+Measurement: We calculate the correlation coefficient (r) between RT 
+Y
+​	
+  and RT 
+X
+​	
+ , shifting RT 
+X
+​	
+  backward in time (i.e., correlating RT 
+Y
+​	
+ (t) with RT 
+X
+​	
+ (t−lag)).
+
+Decision Rule: The highest positive correlation coefficient at a positive lag (where X precedes Y) suggests that X is a downstream dependency of Y (i.e., Y calls X).
+
+Python Implementation for Correlation Inference
+
+
+
+def infer_dependency_correlation(data, services, lag_max=5, threshold=0.6):
+    inferred_dependencies = []
+    
+    # Iterate over every possible pair of services (Caller Candidate, Callee Candidate)
+    for caller in services:
+        for callee in services:
+            if caller == callee:
+                continue
+
+            caller_rt = data[f'{caller}_RT']
+            callee_rt = data[f'{callee}_RT']
+            
+            best_corr = -1
+            best_lag = 0
+            
+            # Check for correlation at various time lags (1 to lag_max)
+            for lag in range(1, lag_max + 1):
+                # Align the series: correlates Caller_RT(t) with Callee_RT(t - lag)
+                # If lag=1, Callee's past value is correlated with Caller's current value.
+                # This implies Callee precedes Caller.
+                
+                # Slicing for alignment
+                caller_aligned = caller_rt.iloc[lag:]
+                callee_lagged = callee_rt.iloc[:-lag]
+                
+                # Ensure the slices are the same length
+                if len(caller_aligned) == 0:
+                    continue
+
+                # Calculate Pearson Correlation
+                corr, _ = pearsonr(caller_aligned, callee_lagged)
+                
+                if corr > best_corr:
+                    best_corr = corr
+                    best_lag = lag
+
+            # If the best correlation exceeds the threshold AND the lag is positive:
+            if best_corr >= threshold and best_lag > 0:
+                # Dependency found: Caller -> Callee (Caller calls Callee)
+                inferred_dependencies.append((caller, callee, best_corr, best_lag))
+                
+    return inferred_dependencies
+
+inferred_edges = infer_dependency_correlation(data, services, lag_max=5, threshold=0.5)
+
+print("\n--- Inferred Dependencies (Caller -> Callee) ---")
+for caller, callee, corr, lag in inferred_edges:
+    print(f"-> {caller} calls {callee}: Correlation={corr:.2f} at Lag={lag} (Callee precedes Caller)")
+
+# --- 3. Construct the Inferred Graph ---
+G_inferred = nx.DiGraph()
+G_inferred.add_nodes_from(services)
+for caller, callee, corr, lag in inferred_edges:
+    G_inferred.add_edge(caller, callee, weight=corr)
+
+
+Step 3: Resulting Dynamic Dependency Graph
+The final step is to visualize the inferred graph. The strength of the correlation can be used as the weight or thickness of the edge.
+
+  
+# --- 4. Visualize the Inferred Graph (Adding Edge Weights for Correlation) ---
+def draw_inferred_graph(G, inferred_edges):
+    pos = nx.circular_layout(G) 
+
+    # Edge labels based on correlation
+    edge_labels = { (u, v): f"Corr={d['weight']:.2f}" 
+                    for u, v, d in G.edges(data=True) }
+    
+    # Edge widths based on correlation strength
+    edge_widths = [d['weight'] * 5 for u, v, d in G.edges(data=True)]
+
+    plt.figure(figsize=(10, 10))
+    nx.draw_networkx_nodes(G, pos, node_color='lightgreen', node_size=3000, edgecolors='black')
+    
+    # Draw edges with width proportional to correlation
+    nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowstyle='->', 
+                           arrowsize=20, width=edge_widths)
+
+    # Draw node labels
+    nx.draw_networkx_labels(G, pos, font_size=12, font_weight='bold')
+    
+    # Draw edge correlation labels
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='red', font_size=8)
+
+    plt.title("Inferred Service Call Graph using Cross-Correlation", fontsize=16)
+    plt.axis('off')
+    plt.show()
+
+draw_inferred_graph(G_inferred, inferred_edges)
+
