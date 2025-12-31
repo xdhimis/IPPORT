@@ -1,0 +1,348 @@
+That is a highly insightful constraint. In a real-world, black-box scenario, you often do not have the explicit caller-callee relationship (the "trace" data) and must infer the dependencies (the edges) solely from time-series performance metrics (QPS, RT, Error Rate) collected from each service (the nodes).
+
+This step is called Dependency Graph Inference or Causal Discovery, and it is where AI/ML methods truly shine.
+
+The core principle used is Causality and Correlation: If Service A calls Service B, then a sudden change in Service B's metrics (especially RT or Error Rate) will often be followed, moments later, by a corresponding change in Service A's metrics.
+
+Here is the step-by-step approach using a simple, computationally cheap method based on Time-Lagged Cross-Correlation, which is a practical way to infer causation from time-series data.
+
+
+Step 2: AI/ML Inference using Cross-Correlation
+We will use Time-Lagged Cross-Correlation on the Response Time (RT) series.
+
+Hypothesis: If Service Y calls Service X (i.e., Y→X), then a spike in X's RT will cause a spike in Y's RT at the same time or a little later.
+
+Measurement: We calculate the correlation coefficient (r) between RT 
+Y
+​	
+  and RT 
+X
+​	
+ , shifting RT 
+X
+​	
+  backward in time (i.e., correlating RT 
+Y
+​	
+ (t) with RT 
+X
+​	
+ (t−lag)).
+
+Decision Rule: The highest positive correlation coefficient at a positive lag (where X precedes Y) suggests that X is a downstream dependency of Y (i.e., Y calls X).
+
+Python Implementation for Correlation Inference
+
+
+
+def infer_dependency_correlation(data, services, lag_max=5, threshold=0.6):
+    inferred_dependencies = []
+    
+    # Iterate over every possible pair of services (Caller Candidate, Callee Candidate)
+    for caller in services:
+        for callee in services:
+            if caller == callee:
+                continue
+
+            caller_rt = data[f'{caller}_RT']
+            callee_rt = data[f'{callee}_RT']
+            
+            best_corr = -1
+            best_lag = 0
+            
+            # Check for correlation at various time lags (1 to lag_max)
+            for lag in range(1, lag_max + 1):
+                # Align the series: correlates Caller_RT(t) with Callee_RT(t - lag)
+                # If lag=1, Callee's past value is correlated with Caller's current value.
+                # This implies Callee precedes Caller.
+                
+                # Slicing for alignment
+                caller_aligned = caller_rt.iloc[lag:]
+                callee_lagged = callee_rt.iloc[:-lag]
+                
+                # Ensure the slices are the same length
+                if len(caller_aligned) == 0:
+                    continue
+
+                # Calculate Pearson Correlation
+                corr, _ = pearsonr(caller_aligned, callee_lagged)
+                
+                if corr > best_corr:
+                    best_corr = corr
+                    best_lag = lag
+
+            # If the best correlation exceeds the threshold AND the lag is positive:
+            if best_corr >= threshold and best_lag > 0:
+                # Dependency found: Caller -> Callee (Caller calls Callee)
+                inferred_dependencies.append((caller, callee, best_corr, best_lag))
+                
+    return inferred_dependencies
+
+inferred_edges = infer_dependency_correlation(data, services, lag_max=5, threshold=0.5)
+
+print("\n--- Inferred Dependencies (Caller -> Callee) ---")
+for caller, callee, corr, lag in inferred_edges:
+    print(f"-> {caller} calls {callee}: Correlation={corr:.2f} at Lag={lag} (Callee precedes Caller)")
+
+# --- 3. Construct the Inferred Graph ---
+G_inferred = nx.DiGraph()
+G_inferred.add_nodes_from(services)
+for caller, callee, corr, lag in inferred_edges:
+    G_inferred.add_edge(caller, callee, weight=corr)
+
+
+Step 3: Resulting Dynamic Dependency Graph
+The final step is to visualize the inferred graph. The strength of the correlation can be used as the weight or thickness of the edge.
+
+  
+# --- 4. Visualize the Inferred Graph (Adding Edge Weights for Correlation) ---
+def draw_inferred_graph(G, inferred_edges):
+    pos = nx.circular_layout(G) 
+
+    # Edge labels based on correlation
+    edge_labels = { (u, v): f"Corr={d['weight']:.2f}" 
+                    for u, v, d in G.edges(data=True) }
+    
+    # Edge widths based on correlation strength
+    edge_widths = [d['weight'] * 5 for u, v, d in G.edges(data=True)]
+
+    plt.figure(figsize=(10, 10))
+    nx.draw_networkx_nodes(G, pos, node_color='lightgreen', node_size=3000, edgecolors='black')
+    
+    # Draw edges with width proportional to correlation
+    nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowstyle='->', 
+                           arrowsize=20, width=edge_widths)
+
+    # Draw node labels
+    nx.draw_networkx_labels(G, pos, font_size=12, font_weight='bold')
+    
+    # Draw edge correlation labels
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='red', font_size=8)
+
+    plt.title("Inferred Service Call Graph using Cross-Correlation", fontsize=16)
+    plt.axis('off')
+    plt.show()
+
+draw_inferred_graph(G_inferred, inferred_edges)
+##########################
+import pandas as pd
+import numpy as np
+import networkx as nx
+
+# Re-using the previously generated data for simplicity
+# data = pd.DataFrame(...) # Assume 'data' from previous step is loaded
+# G_inferred = nx.DiGraph() # Assume G_inferred is the graph from previous step
+
+# Define parameters for IQR-based thresholding
+K_MULTIPLIER = 3.0 # A common multiplier for strict outlier detection
+
+def detect_anomalies(G, data, metrics_to_check=['RT', 'QPS', 'Error']):
+    """
+    Calculates statistical bounds and detects current anomalies for each service node.
+    """
+    anomalous_nodes = []
+    
+    # Use the last 20 data points as the "current state" we are checking
+    current_data = data.iloc[-20:]
+
+    for service in G.nodes:
+        is_anomalous = False
+        
+        # We will calculate historical stats from the preceding 80 points
+        historical_data = data.iloc[:-20]
+        
+        for metric_suffix in metrics_to_check:
+            metric_col = f'{service}_{metric_suffix}'
+            
+            if metric_col not in historical_data.columns:
+                continue
+
+            # Calculate historical statistics (Q1, Q3, IQR)
+            Q1 = historical_data[metric_col].quantile(0.25)
+            Q3 = historical_data[metric_col].quantile(0.75)
+            IQR = Q3 - Q1
+            
+            # Calculate Upper and Lower Bounds (Thresholds)
+            UB = Q3 + K_MULTIPLIER * IQR
+            LB = Q1 - K_MULTIPLIER * IQR
+            
+            # Determine the current value (average over the last 20 steps)
+            current_value = current_data[metric_col].mean()
+
+            # Check for anomaly (High QPS/RT/Error Rate)
+            if current_value > UB:
+                anomaly_type = 'High'
+                is_anomalous = True
+            
+            # Check for anomaly (Low QPS/RT, e.g., service is dead or traffic drop)
+            elif current_value < LB:
+                anomaly_type = 'Low'
+                is_anomalous = True
+
+            # Store the current state and anomaly status in the graph node
+            G.nodes[service][f'Current_{metric_suffix}'] = round(current_value, 2)
+            G.nodes[service][f'UB_{metric_suffix}'] = round(UB, 2)
+            
+            if is_anomalous:
+                G.nodes[service]['Anomaly'] = True
+                G.nodes[service][f'Anomaly_{metric_suffix}'] = f"{anomaly_type} ({round(current_value, 2)})"
+                anomalous_nodes.append(service)
+
+    return anomalous_nodes
+
+# Execute Anomaly Detection
+anomalous_services = detect_anomalies(G_inferred, data)
+
+print("\n--- Step 3: Detected Anomalous Services ---")
+if anomalous_services:
+    print(f"Total Anomalous Services: {len(anomalous_services)}")
+    for svc in anomalous_services:
+        print(f"Service: {svc}")
+        for k, v in G_inferred.nodes[svc].items():
+            if 'Anomaly_' in k:
+                print(f"  - {k}: {v}")
+else:
+    print("No significant anomalies detected in the current state.")
+
+# --- Visualizing the Anomalies on the Graph ---
+def draw_anomalous_graph(G):
+    pos = nx.circular_layout(G)
+    
+    node_labels = {}
+    node_colors = []
+    
+    for node in G.nodes:
+        data = G.nodes[node]
+        label = f"{node}\n"
+        
+        color = 'lightgreen'
+        
+        if data.get('Anomaly'):
+            color = 'red'
+            for metric in ['RT', 'QPS', 'Error']:
+                if f'Anomaly_{metric}' in data:
+                    label += f"**{metric} Anomaly:** {data[f'Current_{metric}']}\n"
+        else:
+            label += f"RT: {data.get('Current_RT', 'N/A')}ms\n"
+        
+        node_labels[node] = label
+        node_colors.append(color)
+
+    plt.figure(figsize=(10, 10))
+    
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=3500, alpha=0.9, edgecolors='black')
+    nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowstyle='->', arrowsize=20)
+    nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=9, font_weight='bold')
+
+    plt.title("MicroHECL - Service Call Graph with Anomalies (Step 3: Detection)", fontsize=16)
+    plt.axis('off')
+    plt.show()
+
+# We need to ensure the data generation simulates a spike for this to work perfectly.
+# Our previous data generation favored C_User and B_Auth, let's assume they spiked.
+draw_anomalous_graph(G_inferred)
+
+###########################################################
+# Re-using the G_inferred graph with 'Anomaly' flags from Step 3
+
+def localize_root_cause(G):
+    """
+    Identifies the service most likely to be the root cause based on the
+    downstream precedence rule and propagation analysis.
+    """
+    
+    anomalous_services = [n for n, data in G.nodes(data=True) if data.get('Anomaly')]
+    root_cause_candidates = []
+    
+    # 1. Check the Downstream Dependencies for Anomalies
+    print("\n--- Root Cause Analysis: Checking Downstream Dependencies ---")
+    
+    for service in anomalous_services:
+        is_root_cause = True
+        
+        # G.successors(service) gives the direct downstream services (Callees)
+        downstream_services = list(G.successors(service))
+        
+        if not downstream_services:
+            # If a service has no downstream dependencies (it's a leaf node), 
+            # and it's anomalous, it MUST be the root cause in its path.
+            print(f"Service {service}: Is anomalous and has NO downstream dependencies. **Root Cause Candidate (Leaf)**")
+            root_cause_candidates.append(service)
+            continue
+
+        print(f"Service {service}: Checking its downstream services: {downstream_services}")
+        
+        # Check if any downstream service is also anomalous
+        for downstream_svc in downstream_services:
+            if G.nodes[downstream_svc].get('Anomaly'):
+                # If a downstream service is anomalous, the current service is a SYMPTOM
+                is_root_cause = False
+                print(f"  -> {service} is a SYMPTOM. Anomaly likely propagated from its dependency: {downstream_svc}")
+                break
+        
+        if is_root_cause:
+            print(f"Service {service}: Is anomalous, but none of its dependencies are anomalous. **ROOT CAUSE DETECTED!**")
+            root_cause_candidates.append(service)
+
+    # 2. Final Root Cause Ranking (Handling multiple candidates)
+    # In complex cases, you'd use a more sophisticated ranking score (e.g., based on anomaly severity).
+    # For this demonstration, we'll assume the highest degree of impact (most callers affected) is the main factor,
+    # or simply pick the first one found if only one is expected.
+    
+    if len(root_cause_candidates) > 1:
+        # Simple ranking: choose the anomalous service with the highest number of direct callers (in-degree)
+        final_root_cause = max(root_cause_candidates, key=lambda svc: G.in_degree(svc))
+    elif len(root_cause_candidates) == 1:
+        final_root_cause = root_cause_candidates[0]
+    else:
+        final_root_cause = "Not Found"
+        
+    G.graph['Root_Cause'] = final_root_cause
+    return final_root_cause
+
+# Execute Root Cause Localization
+root_cause = localize_root_cause(G_inferred)
+
+print(f"\n=====================================")
+print(f"✅ MicroHECL FINAL RESULT: The Root Cause is: **{root_cause}**")
+print(f"=====================================")
+
+# --- Visualization of the Final Result ---
+def draw_final_result_graph(G):
+    pos = nx.circular_layout(G)
+    root_cause_node = G.graph.get('Root_Cause', None)
+
+    node_labels = {}
+    node_colors = []
+    
+    for node in G.nodes:
+        data = G.nodes[node]
+        label = f"{node}\n"
+        
+        color = 'lightgreen'
+        
+        if data.get('Anomaly'):
+            color = 'yellow' # Symptom color
+            for metric in ['RT', 'QPS', 'Error']:
+                if f'Anomaly_{metric}' in data:
+                    label += f"**{metric} Anom:** {data[f'Current_{metric}']}\n"
+        
+        if node == root_cause_node:
+            color = 'red' # Root Cause color
+            label += "**ROOT CAUSE**"
+            
+        node_labels[node] = label
+        node_colors.append(color)
+
+    plt.figure(figsize=(10, 10))
+    
+    nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=4000, alpha=0.9, edgecolors='black')
+    nx.draw_networkx_edges(G, pos, edge_color='gray', arrows=True, arrowstyle='->', arrowsize=20)
+    nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=9, font_weight='bold')
+
+    plt.title("MicroHECL - Final Root Cause Localization", fontsize=16)
+    plt.axis('off')
+    plt.show()
+
+draw_final_result_graph(G_inferred)
+
