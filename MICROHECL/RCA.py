@@ -1,5 +1,3 @@
-import requests
-import json
 import networkx as nx
 import pandas as pd
 import numpy as np
@@ -10,9 +8,6 @@ import time
 import argparse
 from datetime import datetime, timedelta
 from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
-
-# Note: Using PrometheusConnect from prometheus_api_client as requested.
-# Ensure prometheus_api_client is installed in your environment (pip install prometheus_api_client).
 
 # Modular Functions
 
@@ -47,21 +42,22 @@ def query_prom(pc, query, start, end, step='60s'):
     )
     return data
 
-def discover_graph(pc, prom_url, baseline_start, baseline_end, current_start, current_end):
+def discover_graph(pc, baseline_start, baseline_end, current_start, current_end):
     """
-    Step 1: Discover workloads and build directed graph.
+    Step 1: Discover workloads and build directed graph using PrometheusConnect.
     """
     # Union time range for discovery
     union_start = min(baseline_start, current_start)
     union_end = max(baseline_end, current_end)
     time_range = f'[{union_end - union_start}s]'
 
-    # Discover unique workloads using HTTP since PrometheusConnect may not support label values directly
+    # Discover unique workloads using label_values query
     workloads = set()
     for label in ['source_workload', 'destination_workload']:
-        resp = requests.get(f'{prom_url}/api/v1/label/{label}/values')
-        if resp.status_code == 200:
-            workloads.update(resp.json().get('data', []))
+        label_query = f'label_values(istio_requests_total, {label})'
+        data = pc.custom_query(query=label_query)
+        if data:
+            workloads.update([item['value'] for item in data])
 
     # Build graph
     G = nx.DiGraph()
@@ -118,13 +114,13 @@ def collect_metrics(pc, G, baseline_start, baseline_end, current_start, current_
         if len(rt_baseline) == 0 or len(rt_current) == 0:
             continue
 
-        # Performance (RT)
+        # Performance (RT) - For baseline features, use neutral values assuming normal
         baseline_mean, baseline_std, baseline_max = np.mean(rt_baseline), np.std(rt_baseline), np.max(rt_baseline)
         over_max_count = np.sum(rt_current > baseline_max)
         max_delta = np.max(rt_current) - baseline_max
         over_avg_count = np.sum(rt_current > baseline_mean)
         avg_ratio = np.mean(rt_current) / baseline_mean if baseline_mean != 0 else 0
-        baseline_features['performance'][edge_key] = [over_max_count, max_delta, over_avg_count, avg_ratio]
+        baseline_features['performance'][edge_key] = [0, 0, 0, 1.0]  # Neutral normal values
         current_features['performance'][edge_key] = [over_max_count, max_delta, over_avg_count, avg_ratio]
 
         # Reliability (Error)
@@ -144,7 +140,7 @@ def collect_metrics(pc, G, baseline_start, baseline_end, current_start, current_
             else:
                 corr_rt_error = 0
 
-            baseline_features['reliability'][edge_key] = [baseline_outlier_val, 0, 0, 0, 0]  # Placeholder
+            baseline_features['reliability'][edge_key] = [baseline_outlier_val, 0, 0, 0, 0]  # Using computed baseline outlier, placeholders for others
             current_features['reliability'][edge_key] = [0, current_outlier_val, rt_over_thresh, max_error, corr_rt_error]
 
         # Traffic (QPS)
@@ -164,7 +160,7 @@ def collect_metrics(pc, G, baseline_start, baseline_end, current_start, current_
             else:
                 corr_cluster = 0
 
-            baseline_features['traffic'][edge_key] = [0, 0, 0]  # Placeholder
+            baseline_features['traffic'][edge_key] = [0, 0, 0]  # Placeholder neutral
             current_features['traffic'][edge_key] = [mean_delta, std_delta, outlier_count]
 
             vectors['current'][edge_key]['corr_cluster'] = corr_cluster  # Store for later use
@@ -188,12 +184,12 @@ def detect_anomalies(baseline_features, current_features, vectors):
                 if typ == 'performance':
                     model = OneClassSVM(nu=0.1, kernel="rbf", gamma=0.1)
                     model.fit(base_feats)
-                    if model.predict(curr_feats) == [-1]:
+                    if model.predict(curr_feats)[0] == -1:
                         anomalies.setdefault(edge_key, []).append(typ)
                 elif typ == 'reliability':
                     model = IsolationForest(contamination=0.1)
                     model.fit(base_feats)
-                    if model.predict(curr_feats) == [-1]:
+                    if model.predict(curr_feats)[0] == -1:
                         anomalies.setdefault(edge_key, []).append(typ)
                 elif typ == 'traffic':
                     # 3-sigma + corr
@@ -202,8 +198,11 @@ def detect_anomalies(baseline_features, current_features, vectors):
                     if outlier_count > 0 and corr_cluster > 0.9:
                         anomalies.setdefault(edge_key, []).append(typ)
                     elif outlier_count > 0:  # Fallback stricter
-                        if np.sum(np.abs(vectors['current'][edge_key]['qps'] - np.mean(vectors['baseline'][edge_key]['qps'])) > 4 * np.std(vectors['baseline'][edge_key]['qps']) ) > 0:
-                            anomalies.setdefault(edge_key, []).append(typ)
+                        baseline_qps = vectors['baseline'].get(edge_key, {}).get('qps', np.array([]))
+                        current_qps = vectors['current'].get(edge_key, {}).get('qps', np.array([]))
+                        if len(baseline_qps) > 0 and len(current_qps) > 0:
+                            if np.sum(np.abs(current_qps - np.mean(baseline_qps)) > 4 * np.std(baseline_qps)) > 0:
+                                anomalies.setdefault(edge_key, []).append(typ)
     return anomalies
 
 def auto_select_entry(G, anomalies, pc, current_start, current_end):
@@ -214,10 +213,12 @@ def auto_select_entry(G, anomalies, pc, current_start, current_end):
     if not anomalies:
         # Fallback to highest QPS destination
         q = 'topk(1, sum(rate(istio_requests_total[10m])) by (destination_workload))'
-        data = query_prom(pc, q, current_start, current_end)
+        data = pc.custom_query(query=q)
         if data:
-            df = MetricRangeDataFrame(data)
-            return df['destination_workload'].iloc[-1] if 'destination_workload' in df.columns else None
+            # Extract the top destination_workload
+            for result in data:
+                if 'metric' in result and 'destination_workload' in result['metric']:
+                    return result['metric']['destination_workload']
         return None
 
     # Count anomalies per node (as callee)
@@ -247,7 +248,7 @@ def perform_rca(G, entry_service, anomalies, vectors):
     for typ in ['performance', 'reliability', 'traffic']:
         backtrack_dir = directions[typ]
         # For downstream propagation types, check callees (successors); for upstream, check callers (predecessors)
-        neighbors = G.successors(entry_service) if backtrack_dir == 'downstream' else G.predecessors(entry_service)
+        neighbors = list(G.successors(entry_service)) if backtrack_dir == 'downstream' else list(G.predecessors(entry_service))
         for neigh in neighbors:
             edge_key = f"{entry_service}->{neigh}" if backtrack_dir == 'downstream' else f"{neigh}->{entry_service}"
             if edge_key in anomalies and typ in anomalies[edge_key]:
@@ -293,7 +294,7 @@ def perform_rca(G, entry_service, anomalies, vectors):
 def main():
     args = parse_arguments()
     pc = PrometheusConnect(url=args.prom_url, disable_ssl=True)  # Assume no SSL; adjust as needed
-    G, workloads = discover_graph(pc, args.prom_url, args.baseline_start, args.baseline_end, args.current_start, args.current_end)
+    G, workloads = discover_graph(pc, args.baseline_start, args.baseline_end, args.current_start, args.current_end)
     baseline_features, current_features, vectors = collect_metrics(pc, G, args.baseline_start, args.baseline_end, args.current_start, args.current_end)
     anomalies = detect_anomalies(baseline_features, current_features, vectors)
 
